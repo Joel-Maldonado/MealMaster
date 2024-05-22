@@ -2,6 +2,8 @@
 #include <Elegoo_TFTLCD.h>  // Hardware-specific library
 #include <TouchScreen.h>
 #include "Servo.h"
+#include <DS3231.h>
+
 
 #if defined(__SAM3X8E__)
 #undef __FlashStringHelper::F(string_literal)
@@ -50,12 +52,15 @@ Elegoo_TFTLCD tft(LCD_CS, LCD_CD, LCD_WR, LCD_RD, LCD_RESET);
 
 Servo servo;
 
-#define SERVO_PIN 29
+#define SERVO_PIN 31
 // - A pulse width of 1ms causes the servo to rotate forward at its fastest speed.
 // - Increasing the pulse width from 1ms to 1.5ms decreases the forward speed, with 1.5ms causing the servo to stop.
 // - A pulse width of 1.5ms to 2ms causes the servo to rotate backward, with speeds increasing as the pulse width approaches 2ms.
 
 const float SECS_FOR_DEGREE = 0.006;  // Retrieved from servo specifications
+
+// DS3231 Time Module
+DS3231  rtc(SDA, SCL);
 
 enum Page {
   HOME,
@@ -66,17 +71,22 @@ enum Page {
 Page page;
 
 
-// Time slots
-int hour[3] = { 9, 12, 6 };
-int minute[3] = { 30, 0, 50 };
-int isPM[3] = { 1, -1, -1 };
+float dispense_time = 5.0;
 
-bool buttonsActive = true;
+// Time slots 24H
+Time timeSlots[3] = { };
+
+// Changing Variables (TIMES HH:MM)
+String nextDispensingTimeStr = "No Times Set!";
+
 
 void setup(void) {
   Serial.begin(9600);
   servo.attach(SERVO_PIN);  // attach the servo
   tft.reset();
+  rtc.begin();
+
+  loadTimeSlots();
 
   uint16_t identifier = tft.readID();
   if (identifier == 0x9325) {
@@ -112,6 +122,24 @@ void setup(void) {
   HomePage();
 }
 
+
+void loadTimeSlots() {
+  for (int i = 0; i < 3; i++) {
+    Time defaultTime = Time();
+    defaultTime.hour = 255;
+    timeSlots[i] = defaultTime;
+  }
+
+  Time t1 = Time();
+  t1.hour = 9 + 12;
+  t1.min = 30;
+  timeSlots[0] = t1;
+
+  Time t2 = Time();
+  t2.hour = 11 + 12;
+  t2.min = 50;
+  timeSlots[1] = t2;
+}
 
 void loop() {
   TSPoint p = ts.getPoint();
@@ -158,6 +186,128 @@ void loop() {
       HandleEditTimes(px, py);
     }
   }
+
+  if (page == Page::HOME) {
+    UpdateNextDispensingTimeStr(true);
+  } else {
+    nextDispensingTimeStr = "No Times Set!";
+  }
+
+  checkForDispenserTimer();
+
+  Serial.print("Next Timer: ");
+  Serial.print(getNextTime().hour);
+  Serial.print(" : ");
+  Serial.print(getNextTime().min);
+  Serial.println(" ");
+}
+
+void checkForDispenserTimer() {
+  Time t = rtc.getTime();
+  
+  for (int i = 0; i < 3; i++) {
+    if (timeSlots[i].hour != 255) { // Check if time is valid
+      if (t.hour == timeSlots[i].hour && t.min == timeSlots[i].min && t.sec == timeSlots[i].sec) {
+        dispenseFood(dispense_time);
+      }
+    }
+  }
+}
+
+// Time getNextTime(Time times[], int size) {
+//     // Get the current time
+//     Time now = rtc.getTime();
+
+//     Serial.println(rtc.getTimeStr());
+//     int nowMinutes = now.hour * 60 + now.min;
+
+//     // Initialize the nextTime object with default invalid values
+//     Time nextTime;
+//     nextTime.hour = 255;
+
+//     int minDifference = 5000;
+
+//     for (int i = 0; i < size; i++) {
+//         if (times[i].hour != 255) { // Check if time is valid
+//             int thisTimeMinutes = times[i].hour * 60 + times[i].min;
+//             int diff = thisTimeMinutes - nowMinutes;
+
+//             if (diff < 0) {
+//               diff = abs(diff) + 24 * 60;
+//             }
+
+
+//             if (diff < minDifference) {
+//               nextTime = times[i];
+//               minDifference = diff;
+//             }
+//         }
+//     }
+
+//     return nextTime;
+// }
+
+
+Time getNextTime() {
+    // Get the current time
+    Time now = rtc.getTime();
+
+    int nh = now.hour;
+    int nm = now.min;
+    int nowMinutes = nh * 60 + nm;
+
+    // Initialize the nextTime object with default invalid values
+    Time nextTime;
+    nextTime.hour = 255;
+
+    int minDifference = 24 * 60; // Maximum difference in minutes (1 day)
+
+    for (int i = 0; i < 3; i++) {
+        if (timeSlots[i].hour != 255) { // Check if time is valid
+            int th = timeSlots[i].hour;
+            int tm = timeSlots[i].min;
+            int thisTimeMinutes = th * 60 + tm;
+            int diff = thisTimeMinutes - nowMinutes;
+
+            if (diff < 0) { 
+              diff = abs(diff) + 24 * 100; // Adjust for wrap-around to next day
+            }
+
+            if (diff < minDifference) {
+                nextTime = timeSlots[i];
+                minDifference = diff;
+            }
+        }
+    }
+
+    return nextTime;
+}
+
+
+void UpdateNextDispensingTimeStr(bool canActivateDispenser) {
+  Time updatedDispensingTime = getNextTime();
+  if (updatedDispensingTime.hour == 255) { // Failed
+    Serial.println("FAILED UPDATE DISPENSING TIME");
+    return;
+  }
+  String updatedDispensingTimeStr = convertTo12HourFormatStr(updatedDispensingTime);
+
+  // bool activated = false;
+  if (updatedDispensingTimeStr != nextDispensingTimeStr) {
+    tft.fillRect((tft.width() - nextDispensingTimeStr.length() * 4 * 6) / 2, 30, nextDispensingTimeStr.length() * 4 * 6, 32, WHITE);
+
+    nextDispensingTimeStr = updatedDispensingTimeStr;
+    tft.setCursor((tft.width() - nextDispensingTimeStr.length() * 4 * 6) / 2, 30);
+    tft.setTextColor(BLACK);
+    tft.setTextSize(4);
+    tft.print(nextDispensingTimeStr);
+
+    // activated = true;
+  }
+
+  // if (activated && canActivateDispenser) {
+  //   dispenseFood(dispense_time);
+  // }
 }
 
 void HomePage() {
@@ -165,11 +315,9 @@ void HomePage() {
   tft.fillScreen(WHITE);
 
   // Dispensing Time (TIME)
-  String nextDispensingTime = "09:30 PM";
-  tft.setCursor((tft.width() - nextDispensingTime.length() * 4 * 6) / 2, 30);
-  tft.setTextColor(BLACK);
-  tft.setTextSize(4);
-  tft.print(nextDispensingTime);
+  Serial.println("UPDATING DISPENSING TIME STR");
+  UpdateNextDispensingTimeStr(false);
+  Serial.println("FINISHED UPDATING DISPENSING TIME STR");
 
   String nextDispensingTimeCaption = "Next Dispensing Time";
   tft.setCursor((tft.width() - nextDispensingTimeCaption.length() * 2 * 6) / 2, 70);
@@ -186,6 +334,7 @@ void HomePage() {
   tft.setTextSize(2);
   tft.print(dispenseNowText);
 
+
   // Edit Time Button
   String editTimeText = "Edit Times";
   // tft.fillRect((tft.width() - 200)/2,170, 200, 50, BLACK);
@@ -196,6 +345,29 @@ void HomePage() {
   tft.print(editTimeText);
 }
 
+void UpdateTimeSlotEditTimes(int i) {
+  Time t = timeSlots[i];
+  String time;
+  if (t.hour == 255) {
+    time = "--:-- --";
+  } else {
+    time = convertTo12HourFormatStr(t);
+  }
+
+  // CLEAR
+  tft.fillRect((tft.width() - time.length() * 4 * 6) / 2 - 10, 25 + i * 50 - 10, 44 + 20, 30 + 20, WHITE);
+  tft.fillRect((tft.width() - time.length() * 4 * 6) / 2 + 72 - 10, 25 + i * 50 - 10, 44 + 20, 30 + 20, WHITE);
+  tft.fillRect((tft.width() - time.length() * 4 * 6) / 2 + 143 - 10, 25 + i * 50 - 10, 44 + 20, 30 + 20, WHITE);
+
+  tft.drawRect((tft.width() - time.length() * 4 * 6) / 2 - 10, 25 + i * 50 - 10, 44 + 20, 30 + 20, BLACK);
+  tft.drawRect((tft.width() - time.length() * 4 * 6) / 2 + 72 - 10, 25 + i * 50 - 10, 44 + 20, 30 + 20, BLACK);
+  tft.drawRect((tft.width() - time.length() * 4 * 6) / 2 + 143 - 10, 25 + i * 50 - 10, 44 + 20, 30 + 20, BLACK);
+
+  tft.setCursor((tft.width() - time.length() * 4 * 6) / 2, 25 + i * 50);
+  tft.setTextColor(BLACK);
+  tft.setTextSize(4);
+  tft.print(time);
+}
 void EditTimesPage() {
   page = Page::EDIT_TIMES;
 
@@ -203,36 +375,20 @@ void EditTimesPage() {
   tft.setTextColor(BLACK);
   tft.setTextSize(2);
 
-  char buff[10];
-  String time;
-
   // Draw time slots with + and - buttons
   for (int i = 0; i < 3; i++) {
-    strcpy(buff, "");
-    sprintf(buff, "%02d:%02d", hour[i], minute[i]);
-    Serial.println(buff);
+    
+    // tft.drawRect((tft.width() - time.length() * 4 * 6) / 2 - 10, 25 + i * 50 - 10, 44 + 20, 30 + 20, BLACK);
+    // tft.drawRect((tft.width() - time.length() * 4 * 6) / 2 + 72 - 10, 25 + i * 50 - 10, 44 + 20, 30 + 20, BLACK);
+    // tft.drawRect((tft.width() - time.length() * 4 * 6) / 2 + 143 - 10, 25 + i * 50 - 10, 44 + 20, 30 + 20, BLACK);
 
-    time = String(buff);
+    // tft.setCursor((tft.width() - time.length() * 4 * 6) / 2, 25 + i * 50);
+    // tft.setTextColor(BLACK);
+    // tft.setTextSize(4);
+    // tft.print(time);
+    UpdateTimeSlotEditTimes(i);
 
-
-    if (isPM[i] == 1) {
-      time += " PM";
-    } else if (isPM[i] == 0) {
-      time += " AM";
-    } else {
-      time = "--:-- --";
-    }
-
-    tft.drawRect((tft.width() - time.length() * 4 * 6) / 2 - 10, 25 + i * 50 - 10, 44 + 20, 30 + 20, BLACK);
-    tft.drawRect((tft.width() - time.length() * 4 * 6) / 2 + 72 - 10, 25 + i * 50 - 10, 44 + 20, 30 + 20, BLACK);
-    tft.drawRect((tft.width() - time.length() * 4 * 6) / 2 + 143 - 10, 25 + i * 50 - 10, 44 + 20, 30 + 20, BLACK);
-
-    tft.setCursor((tft.width() - time.length() * 4 * 6) / 2, 25 + i * 50);
-    tft.setTextColor(BLACK);
-    tft.setTextSize(4);
-    tft.print(time);
-
-    Serial.println(time);
+    // Serial.println(time);
 
     // delay(100);
   }
@@ -247,64 +403,63 @@ void EditTimesPage() {
 }
 
 void HandleEditTimes(int px, int py) {
-  Serial.println("HANDLING");
-
   for (int i = 0; i < 3; i++) {
+    bool changed = false;
     if ((tft.height() - py) >= 25 + i * 50 - 10 && (tft.height() - py) <= 25 + i * 50 + 30 + 10) {
       if (px >= (tft.width() - 8 * 4 * 6) / 2 - 10 && px <= (tft.width() - 8 * 4 * 6) / 2 + 44 + 10) {
-        hour[i] = hour[i] + 1;
+        timeSlots[i].hour += 1;
+        changed = true;
       }
 
       if (px >= (tft.width() - 8 * 4 * 6) / 2 + 72 - 10 && px <= (tft.width() - 8 * 4 * 6) / 2 + 72 + 44 + 10) {
-        minute[i] = minute[i] + 10;
+        timeSlots[i].min += 1;
+        changed = true;
       }
 
       if (px >= (tft.width() - 8 * 4 * 6) / 2 + 143 - 10 && px <= (tft.width() - 8 * 4 * 6) / 2 + 143 + 44 + 10) {
-        isPM[i] += 1;
-        if (isPM[i] == 2) {
-          isPM[i] = -1;
-        }
+        timeSlots[i].hour += 12;
+        changed = true;
       }
     }
 
-    if (minute[i] > 50) {
-      minute[i] = 0;
+    if (timeSlots[i].min > 59) {
+      timeSlots[i].min = 0;
+      changed = true;
     }
 
-    if (hour[i] > 12) {
-      hour[i] = 1;
+    if (timeSlots[i].hour > 24) {
+      timeSlots[i].hour = timeSlots[i].hour % 24;
+      changed = true;
+    }
+
+    if (changed) {
+      UpdateTimeSlotEditTimes(i);
     }
   }
-  EditTimesPage();
 }
 
-void HiddenPage() {
-  page = Page::HIDDEN;
-
-  tft.fillScreen(BLACK);
-
-  uint16_t pawColor = WHITE;
-
-  // Main paw pad (centered and adjusted)
-  tft.fillCircle(160, 120, 40, pawColor);  // Main pad
-
-  // Top-left toe
-  tft.fillCircle(120, 120, 20, pawColor);
-  delay(200);
-
-  // Top-right toe
-  tft.fillCircle(200, 120, 20, pawColor);
-  delay(200);
-
-  // Bottom-left toe
-  tft.fillCircle(140, 80, 15, pawColor);
-  delay(200);
-
-  // Bottom-right toe
-  tft.fillCircle(180, 80, 15, pawColor);
-  delay(200);
+// ---------------- RTC TIME STUFF ----------------
+String convertTo12HourFormatStr(Time time) {
+    int hour12 = time.hour % 12;
+    if (hour12 == 0) {
+        hour12 = 12;
+    }
+    String period = (time.hour <= 12) ? "AM" : "PM";
+    
+    // Ensure minute is always two digits
+    String minuteStr = String(time.min);
+    if (time.min < 10) {
+        minuteStr = "0" + minuteStr;
+    }
+    
+    // Ensure hour is always two digits
+    String hourStr = String(hour12);
+    if (hour12 < 10) {
+        hourStr = "0" + hourStr;
+    }
+    
+    return hourStr + ":" + minuteStr + " " + period;
 }
-
 
 
 // ---------------- SERVO STUFF ----------------
@@ -330,6 +485,17 @@ void rotateCounterClockwiseDeg(float degree, float speed) {
   float stopTime_ms = SECS_FOR_DEGREE * degree * (1.0 / speed) * 1000.0;
   delay(stopTime_ms);
 
+  // Stop
+  servo.write(1500);
+}
+
+
+void dispenseFood(float secs) {
+  Serial.println("DISPENSING!");
+
+  // Move counterclockwise
+  float microSeconds = 2000;
+  delay(secs * 1000);
   // Stop
   servo.write(1500);
 }
